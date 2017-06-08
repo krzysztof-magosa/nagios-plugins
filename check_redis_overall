@@ -1,0 +1,215 @@
+#!/usr/bin/env python
+
+#
+#
+# MIT License
+#
+# Copyright (c) 2017 Krzysztof Magosa <krzysztof@magosa.pl>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+#
+# Nagios check for Redis
+# Visit: https://github.com/krzysztof-magosa/nagios-plugins
+#
+
+import argparse
+import redis
+import re
+
+
+OK = 0
+WARN = 1
+CRIT = 2
+UNKN = 3
+
+
+def extract_ref(thresholds_spec, n):
+    thresholds = thresholds_spec.split(",")
+
+    m = re.match(r"([!=<>]+)(.+)", thresholds[n])
+    return int(m.group(2))
+
+
+def extract_warn(thresholds_spec):
+    if "," in thresholds_spec:
+        return extract_ref(thresholds_spec, 0)
+    else:
+        return ""
+
+
+def extract_crit(thresholds_spec):
+    return extract_ref(thresholds_spec, -1)
+
+
+def verify_threshold(value, threshold_spec):
+    m = re.match(r"([!=<>]+)(.+)", threshold_spec)
+    sign = m.group(1)
+    ref = m.group(2)
+
+    if isinstance(value, int):
+        ref = int(ref)
+
+    if sign == "!=":
+        return value != ref
+    elif sign == "<":
+        return value < ref
+    elif sign == "<=":
+        return value < ref
+    elif sign == ">":
+        return value > ref
+    elif sign == ">=":
+        return value > ref
+    else:
+        raise RuntimeError("Unsupported condition")
+
+
+def verify_thresholds(value, thresholds_spec):
+    thresholds = thresholds_spec.split(",")
+
+    if verify_threshold(value, thresholds[-1]):
+        return CRIT
+    elif verify_threshold(value, thresholds[0]):
+        return WARN
+    else:
+        return OK
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--host", default="127.0.0.1")
+parser.add_argument("--port", type=int, default="6379")
+parser.add_argument("--password")
+parser.add_argument("--timeout", type=int, default=3)
+
+parser.add_argument("--uptime", default="<3600,<300")
+parser.add_argument("--connected-clients", default=">7500,>9000")
+parser.add_argument("--used-memory", default=">4096,>6144")
+parser.add_argument("--replication-delay", default=">60,>120")
+args = parser.parse_args()
+
+try:
+    r = redis.StrictRedis(
+        host=args.host,
+        port=args.port,
+        password=args.password,
+        socket_timeout=args.timeout
+    )
+
+    info = r.info()
+
+    conditions = [
+        (
+            info["uptime_in_seconds"],
+            args.uptime
+        ),
+        (
+            info["connected_clients"],
+            args.connected_clients
+        ),
+        (
+            int(info["used_memory"]/1024/1024),
+            args.used_memory
+        ),
+        (
+            info["rdb_last_bgsave_status"],
+            "!=ok"
+        ),
+        (
+            info["aof_last_bgrewrite_status"],
+            "!=ok"
+        ),
+        (
+            info["aof_last_write_status"],
+            "!=ok"
+        )
+    ]
+
+    if info["role"] == "slave":
+        conditions.append(
+            (
+                info["master_last_io_seconds_ago"],
+                args.replication_delay
+            )
+        )
+
+    #
+
+    overall_status = 0
+    for cond in conditions:
+        status = verify_thresholds(cond[0], cond[1])
+        overall_status = max(overall_status, status)
+
+    human_status = [
+        "uptime: {}s".format(info["uptime_in_seconds"]),
+        "clients: {}".format(info["connected_clients"]),
+        "ops: {}/s".format(info["instantaneous_ops_per_sec"]),
+        "memory: {}M".format(int(info["used_memory"]/1024/1024)),
+        "rdb bgsave status: {}".format(info["rdb_last_bgsave_status"]),
+        "aof bgrewrite status: {}".format(info["aof_last_bgrewrite_status"]),
+        "aof write status: {}".format(info["aof_last_write_status"])
+    ]
+
+    if info["role"] == "slave":
+        human_status.append(
+            "replication delay: {}s".format(info["master_last_io_seconds_ago"])
+        )
+
+    #
+
+    graph_status = [
+        "clients={};{};{};".format(
+            info["connected_clients"],
+            extract_warn(args.connected_clients),
+            extract_crit(args.connected_clients)
+        ),
+        "memory={}B;{};{};".format(
+            info["used_memory"],
+            extract_warn(args.used_memory)*1024*1024,
+            extract_crit(args.used_memory)*1024*1024
+        ),
+        "ops_per_sec={};;;".format(info["instantaneous_ops_per_sec"]),
+        "rdb_bgsave_status={};;0;".format(
+            1 if info["rdb_last_bgsave_status"] == "ok" else 0
+        ),
+        "rdb_bgrewrite_status={};;0;".format(1 if info["aof_last_bgrewrite_status"] == "ok" else 0),
+        "aof_write_status={};;0;".format(1 if info["aof_last_write_status"] == "ok" else 0)
+    ]
+
+    if info["role"] == "slave":
+        graph_status.append(
+            "replication_delay={}s;{};{};".format(
+                info["master_last_io_seconds_ago"],
+                extract_warn(args.replication_delay),
+                extract_crit(args.replication_delay)
+            )
+        )
+
+    #
+
+    print(
+        "{}|{}".format(
+            ", ".join(human_status),
+            " ".join(graph_status)
+        )
+    )
+
+    exit(overall_status)
+except Exception as e:
+    print("Cannot fetch information from Redis: {}".format(e))
+    exit(UNKN)
