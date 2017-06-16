@@ -188,17 +188,13 @@ try:
             1 if info["rdb_last_bgsave_status"] == "ok" else 0
         ),
         "rdb_bgrewrite_status={};;0;".format(1 if info["aof_last_bgrewrite_status"] == "ok" else 0),
-        "aof_write_status={};;0;".format(1 if info["aof_last_write_status"] == "ok" else 0)
-    ]
-
-    if info["role"] == "slave":
-        graph_status.append(
-            "replication_delay={}s;{};{};".format(
-                info["master_last_io_seconds_ago"],
-                extract_warn(args.replication_delay),
-                extract_crit(args.replication_delay)
-            )
+        "aof_write_status={};;0;".format(1 if info["aof_last_write_status"] == "ok" else 0),
+        "replication_delay={}s;{};{};".format(
+            info["master_last_io_seconds_ago"] if info["role"] == "slave" else 0,
+            extract_warn(args.replication_delay),
+            extract_crit(args.replication_delay)
         )
+    ]
 
     #
 
